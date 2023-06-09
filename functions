@@ -145,15 +145,6 @@ service_create_container() {
     return 1
   fi
 
-  dokku_log_verbose_quiet "Creating container database"
-  "$DOCKER_BIN" container exec "$SERVICE_NAME" su - postgres -c "createdb -E utf8 $DATABASE_NAME" 2>/dev/null || dokku_log_verbose_quiet 'Already exists'
-
-  dokku_log_verbose_quiet "Securing connection to database"
-  service_pause "$SERVICE" >/dev/null
-  "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/scripts/create_ssl_certs.sh" "$SERVICE_HOST_ROOT" &>/dev/null
-  "$DOCKER_BIN" container run --rm -i -v "$SERVICE_HOST_ROOT/data:/var/lib/postgresql/data" -v "$SERVICE_HOST_ROOT/certs:/var/lib/postgresql/certs" "$PLUGIN_IMAGE:$PLUGIN_IMAGE_VERSION" bash -s <"$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/scripts/enable_ssl.sh" &>/dev/null
-  rm -rf "$SERVICE_HOST_ROOT/certs"
-
   suppress_output "$DOCKER_BIN" container start "$(cat "$SERVICE_ROOT/ID")"
   service_port_reconcile_status "$SERVICE"
 
@@ -164,13 +155,18 @@ service_create_container() {
 service_export() {
   local SERVICE="$1"
   local SERVICE_ROOT="$PLUGIN_DATA_ROOT/$SERVICE"
+  local SERVICE_HOST_ROOT="$PLUGIN_DATA_HOST_ROOT/$SERVICE"
   local SERVICE_NAME="$(get_service_name "$SERVICE")"
-  local DATABASE_NAME="$(get_database_name "$SERVICE")"
   local PASSWORD="$(service_password "$SERVICE")"
 
+  [[ -f "$SERVICE_ROOT/IMAGE" ]] && PLUGIN_IMAGE="$(cat "$SERVICE_ROOT/IMAGE")"
+  [[ -f "$SERVICE_ROOT/IMAGE_VERSION" ]] && PLUGIN_IMAGE_VERSION="$(cat "$SERVICE_ROOT/IMAGE_VERSION")"
+
   [[ -n $SSH_TTY ]] && stty -opost
-  "$DOCKER_BIN" container exec "$SERVICE_NAME" env PGPASSWORD="$PASSWORD" pg_dump -Fc --no-acl --no-owner -h localhost -U postgres -w "$DATABASE_NAME"
+  docker container stop "$SERVICE_NAME" >/dev/null
+  docker container run -v "$SERVICE_HOST_ROOT/data:/data" -e "NEO4J_AUTH=neo4j/$PASSWORD" -e "NEO4J_PASSWORD=$PASSWORD" "$PLUGIN_IMAGE:$PLUGIN_IMAGE_VERSION" neo4j-admin dump --to=-
   status=$?
+  service_start "$SERVICE" >/dev/null
   [[ -n $SSH_TTY ]] && stty opost
   exit $status
 }
@@ -180,13 +176,19 @@ service_import() {
   local SERVICE_ROOT="$PLUGIN_DATA_ROOT/$SERVICE"
   local SERVICE_HOST_ROOT="$PLUGIN_DATA_HOST_ROOT/$SERVICE"
   local SERVICE_NAME="$(get_service_name "$SERVICE")"
-  local DATABASE_NAME="$(get_database_name "$SERVICE")"
   local PASSWORD="$(service_password "$SERVICE")"
+
+  [[ -f "$SERVICE_ROOT/IMAGE" ]] && PLUGIN_IMAGE="$(cat "$SERVICE_ROOT/IMAGE")"
+  [[ -f "$SERVICE_ROOT/IMAGE_VERSION" ]] && PLUGIN_IMAGE_VERSION="$(cat "$SERVICE_ROOT/IMAGE_VERSION")"
 
   if [[ -t 0 ]]; then
     dokku_log_fail "No data provided on stdin."
   fi
-  "$DOCKER_BIN" container exec -i "$SERVICE_NAME" env PGPASSWORD="$PASSWORD" pg_restore -h localhost -cO --if-exists -d "$DATABASE_NAME" -U postgres -w
+  docker stop "$SERVICE_NAME" >/dev/null
+  docker run -v "$SERVICE_HOST_ROOT/data:/data" -e "NEO4J_AUTH=neo4j/$PASSWORD" -e "NEO4J_PASSWORD=$PASSWORD" -i "$PLUGIN_IMAGE:$PLUGIN_IMAGE_VERSION" neo4j-admin load --force --from=-
+  status=$?
+  service_start "$SERVICE" >/dev/null
+  exit $status
 }
 
 service_start() {
